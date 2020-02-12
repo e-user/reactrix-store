@@ -1,0 +1,30 @@
+[package]
+name = "reactrix-store"
+version = "0.1.0"
+authors = ["Alexander Dorn <ad@sodosopa.io>"]
+edition = "2018"
+
+[dependencies]
+reactrix = { path = "../reactrix" }
+rocket = "0.4.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.41"
+rmp-serde = "0.14.0"
+zmq = "0.9.2"
+log = "0.4.8"
+exitfailure = "0.5.1"
+dotenv = "0.14.1"
+env_logger = "0.7.1"
+sodiumoxide = "0.2.5"
+structopt = "0.2.18"
+hex = "0.4.0"
+failure = "0.1.6"
+
+[dependencies.rocket_contrib]
+version = "0.4.2"
+default-features = false
+features = ["diesel_postgres_pool", "json"]
+
+[dependencies.diesel]
+version = "1.4.3"
+features = ["serde_json", "chrono", "postgres"]
