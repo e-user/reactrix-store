@@ -1753,15 +1753,15 @@ name = "reactrix"
 version = "0.1.0"
 dependencies = [
  "base64 0.11.0",
- "blake2",
  "chrono",
  "diesel",
  "dotenv",
  "failure",
- "hex",
  "juniper",
  "juniper_warp",
+ "lazy_static",
  "log 0.4.8",
+ "regex",
  "reqwest",
  "rmp-serde",
  "serde",
@@ -1775,6 +1775,7 @@ dependencies = [
 name = "reactrix-store"
 version = "0.1.0"
 dependencies = [
+ "blake2",
  "diesel",
  "dotenv",
  "env_logger",

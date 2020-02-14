@@ -19,6 +19,7 @@ sodiumoxide = "0.2.5"
 structopt = "0.2.18"
 hex = "0.4.0"
 failure = "0.1.6"
+blake2 = "0.8.1"
 
 [dependencies.rocket_contrib]
 version = "0.4.2"

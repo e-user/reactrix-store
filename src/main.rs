@@ -16,8 +16,10 @@
 
 #![feature(proc_macro_hygiene, decl_macro, try_trait)]
 
+mod datastore;
 mod mq;
 
+use datastore::{DataStore, DataStoreError};
 use diesel::prelude::*;
 use diesel::result::DatabaseErrorKind;
 use diesel::result::Error as DieselError;
@@ -25,10 +27,8 @@ use dotenv::dotenv;
 use exitfailure::ExitFailure;
 use log::{error, warn};
 use mq::Tx;
-use reactrix::{models, schema};
-use reactrix::{ApiResult, DataStore, DataStoreError};
-use rocket::fairing;
-use rocket::fairing::Fairing;
+use reactrix::{schema, ApiResult, NewEvent};
+use rocket::fairing::{self, Fairing};
 use rocket::http::Status;
 use rocket::response::Responder;
 use rocket::{catch, catchers, get, post, put, routes, Request, Response, Rocket, State};
@@ -127,7 +127,7 @@ struct Event {
     data: Map<String, Value>,
 }
 
-impl From<Event> for models::NewEvent {
+impl From<Event> for NewEvent {
     fn from(event: Event) -> Self {
         Self {
             version: event.version,
@@ -148,8 +148,8 @@ fn create(
     let event = event?.into_inner();
 
     let result = diesel::insert_into(schema::events::table)
-        .values::<models::NewEvent>(event.into())
-        .get_result::<models::Event>(&*conn);
+        .values::<NewEvent>(event.into())
+        .get_result::<reactrix::Event>(&*conn);
 
     match result {
         Ok(event) => match tx.lock()?.send(event.sequence) {
