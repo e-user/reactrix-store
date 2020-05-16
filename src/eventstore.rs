@@ -18,39 +18,21 @@ mod mongo;
 mod postgres;
 
 use failure::Fail;
-use log::warn;
 pub use mongo::*;
 pub use postgres::*;
+use reactrix::{Event, NewEvent};
 
 #[derive(Debug, Fail)]
-pub enum DataStoreError {
+pub enum EventStoreError {
     #[fail(display = "Database error: {}", 0)]
     Database(String),
     #[fail(display = "Record not found")]
     NoRecord,
-    #[fail(display = "Identical hash for different data detected: {}", 0)]
-    Collision(String),
 }
 
-pub type Result<T> = std::result::Result<T, DataStoreError>;
+pub type Result<T> = std::result::Result<T, EventStoreError>;
 
-fn entry_exists(store: &impl DataStore, hash: &[u8], data: &[u8]) -> Result<bool> {
-    match store.retrieve(&hash) {
-        Ok(stored) => {
-            if data == &stored[..] {
-                warn!("Data blob {} is already stored", &hex::encode(hash));
-                return Ok(true);
-            } else {
-                return Err(DataStoreError::Collision(hex::encode(hash)));
-            }
-        }
-
-        Err(DataStoreError::NoRecord) => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
-pub trait DataStore: Send + Sync {
-    fn store(&self, data: &[u8]) -> Result<Vec<u8>>;
-    fn retrieve(&self, id: &[u8]) -> Result<Vec<u8>>;
+pub trait EventStore: Send + Sync {
+    fn store(&self, data: NewEvent) -> Result<i64>;
+    fn retrieve(&self, id: i64) -> Result<Event>;
 }

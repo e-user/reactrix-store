@@ -1,0 +1,194 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: reactrix
+  labels:
+    name: reactrix
+
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  namespace: reactrix
+  name: db
+  labels:
+    app: db
+
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      containers:
+        - name: db
+          image: postgres:11.5
+          imagePullPolicy: Always
+          ports:
+            - name: psql
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: events
+            - name: POSTGRES_PASSWORD
+              value: events
+            - name: POSTGRES_USER
+              value: events
+          volumeMounts:
+            - name: db
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: db
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: reactrix
+  name: db
+
+spec:
+  type: ClusterIP
+  selector:
+    app: db
+  ports:
+    - protocol: TCP
+      port: 5432
+      name: psql
+      targetPort: 5432
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: reactrix
+  name: mongo-init
+
+data:
+  init.js: |
+    db.createCollection('events', {
+      validator: {
+        $jsonSchema: {
+          bsonType: 'object',
+          required: ['sequence', 'version', 'data', 'timestamp'],
+          properties: {
+            sequence: {
+              bsonType: 'long',
+              minimum: 0
+            },
+            version: {
+              bsonType: 'int',
+              minimum: 0
+            },
+            data: {
+              bsonType: 'object'
+            },
+            timestamp: {
+              bsonType: 'date'
+            }
+          }
+        }
+      }
+    });
+
+    db.events.createIndex({sequence: 1}, {unique: 1});
+
+    db.createCollection('data', {
+      validator: {
+        $jsonSchema: {
+          bsonType: 'object',
+          required: ['data'],
+          properties: {
+            data: {
+              bsonType: 'binData'
+            },
+          }
+        }
+      }
+    });
+
+    db.createCollection('counters', {
+      validator: {
+        $jsonSchema: {
+          bsonType: 'object',
+          required: ['sequence'],
+          properties: {
+            sequence: {
+              bsonType: 'long',
+              minimum: 0
+            }
+          }
+        }
+      }
+    });
+
+    db.counters.insert({
+      _id: 'events',
+      sequence: NumberLong(0)
+    });
+
+    db.counters.insert({
+      _id: 'data',
+      sequence: NumberLong(0)
+    });
+)
+
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  namespace: reactrix
+  name: mongo
+  labels:
+    app: mongo
+
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongo
+  template:
+    metadata:
+      labels:
+        app: mongo
+    spec:
+      containers:
+        - name: mongo
+          image: mongo:4.2.6
+          imagePullPolicy: Always
+          ports:
+            - name: mongo
+              containerPort: 27017
+          env:
+            - name: MONGO_INITDB_DATABASE
+              value: reactrix
+          volumeMounts:
+            - name: mongo
+              mountPath: /data/db
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+      volumes:
+        - name: mongo
+        - name: init
+          configMap:
+            name: mongo-init
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: reactrix
+  name: mongo
+spec:
+  type: ClusterIP
+  selector:
+    app: mongo
+  ports:
+    - protocol: TCP
+      port: 27017
+      name: mongo
+      targetPort: 27017

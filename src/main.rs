@@ -14,238 +14,247 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![feature(proc_macro_hygiene, decl_macro, try_trait)]
-
 mod datastore;
+mod eventstore;
 mod mq;
 
-use datastore::{DataStore, DataStoreError};
-use diesel::prelude::*;
-use diesel::result::DatabaseErrorKind;
-use diesel::result::Error as DieselError;
+use bytes::Bytes;
+use datastore::{DataStore, DataStoreError, MongoDataStore, PostgresDataStore};
+use diesel::r2d2::{ConnectionManager, Pool};
+use diesel::PgConnection;
 use dotenv::dotenv;
+use eventstore::{EventStore, EventStoreError, MongoEventStore, PostgresEventStore};
 use exitfailure::ExitFailure;
+use failure::Fail;
 use log::{error, warn};
+use mongodb::{options::ClientOptions, Client};
 use mq::Tx;
-use reactrix::{schema, ApiResult, NewEvent};
-use rocket::fairing::{self, Fairing};
-use rocket::http::Status;
-use rocket::response::Responder;
-use rocket::{catch, catchers, get, post, put, routes, Request, Response, Rocket, State};
-use rocket_contrib::database;
-use rocket_contrib::databases::diesel::PgConnection;
-use rocket_contrib::json;
-use rocket_contrib::json::{Json, JsonError, JsonValue};
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
-use std::ops::Try;
+use reactrix::{ApiResult, NewEvent};
+use serde::Serialize;
+use std::convert::Infallible;
+use std::env;
+use std::net::Ipv4Addr;
 use std::result::Result;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use structopt::StructOpt;
+use url::Url;
+use warp::http::StatusCode;
+use warp::{Filter, Reply};
 
-#[derive(Debug)]
-struct StoreResponder(Status, JsonValue);
+type PgPool = Pool<ConnectionManager<PgConnection>>;
 
-impl StoreResponder {
-    fn ok<T: Serialize>(status: Status, data: Option<&T>) -> Self {
-        match data {
-            None => StoreResponder(status, json!(ApiResult::<Option<()>>::Ok { data: None })),
-            Some(d) => StoreResponder(status, json!(ApiResult::Ok { data: Some(d) })),
-        }
-    }
+#[derive(Debug, Fail)]
+pub enum ReactrixError {
+    #[fail(display = "Environment variable {} is missing", 0)]
+    Var(String),
+    #[fail(display = "Unknown database type {}", 0)]
+    UnknownDatabase(String),
+}
 
-    fn error(status: Status, reason: &str) -> Self {
-        StoreResponder(
-            status,
-            json!(ApiResult::<()>::Error {
-                reason: reason.to_string()
-            }),
-        )
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "kebab-case")]
+struct Config {
+    address: String,
+    http_port: u16,
+    zmq_port: u16,
+}
+
+fn error_response(reason: String, status: StatusCode) -> warp::reply::Response {
+    warp::reply::with_status(
+        warp::reply::json(&ApiResult::<String>::Error { reason }),
+        status,
+    )
+    .into_response()
+}
+
+async fn config_get(config: Config) -> Result<impl Reply, Infallible> {
+    Ok(warp::reply::json(&config))
+}
+
+async fn event_get(sequence: i64, store: Arc<dyn EventStore>) -> Result<impl Reply, Infallible> {
+    match store.retrieve(sequence) {
+        Ok(event) => Ok(warp::reply::json(&ApiResult::Ok { data: event }).into_response()),
+        Err(EventStoreError::NoRecord) => Ok(error_response(
+            "No such event".to_string(),
+            StatusCode::NOT_FOUND,
+        )),
+        Err(EventStoreError::Database(e)) => Ok(error_response(
+            e.to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )),
     }
 }
 
-impl<'r> Responder<'r> for StoreResponder {
-    fn respond_to(self, req: &Request) -> Result<Response<'r>, Status> {
-        Response::build_from(self.1.respond_to(req)?)
-            .status(self.0)
-            .ok()
-    }
-}
-
-impl Try for StoreResponder {
-    type Ok = Self;
-    type Error = Self;
-
-    fn into_result(self) -> Result<Self, Self> {
-        if self.0.code < 300 {
-            Ok(self)
-        } else {
-            Err(self)
-        }
-    }
-
-    fn from_ok(ok: Self::Ok) -> Self {
-        ok
-    }
-
-    fn from_error(error: Self::Error) -> Self {
-        error
-    }
-}
-
-impl<'a> From<JsonError<'a>> for StoreResponder {
-    fn from(error: JsonError) -> Self {
-        match error {
-            JsonError::Io(error) => {
-                StoreResponder::error(Status::BadRequest, &format!("{:?}", error))
-            }
-            JsonError::Parse(_, error) => {
-                StoreResponder::error(Status::BadRequest, &format!("{:?}", error))
-            }
-        }
-    }
-}
-
-impl From<serde_json::Error> for StoreResponder {
-    fn from(error: serde_json::Error) -> Self {
-        StoreResponder::error(Status::BadRequest, &format!("{:?}", error))
-    }
-}
-
-impl<'a> From<PoisonError<MutexGuard<'a, Tx>>> for StoreResponder {
-    fn from(error: PoisonError<MutexGuard<'a, Tx>>) -> Self {
-        StoreResponder::error(
-            Status::InternalServerError,
-            &format!("Couldn't obtain lock: {}", error.to_string()),
-        )
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct Event {
-    version: i32,
-    data: Map<String, Value>,
-}
-
-impl From<Event> for NewEvent {
-    fn from(event: Event) -> Self {
-        Self {
-            version: event.version,
-            data: event.data.into(),
-        }
-    }
-}
-
-#[database("events")]
-struct StoreDbConn(PgConnection);
-
-#[post("/v1/create", format = "application/json", data = "<event>")]
-fn create(
-    conn: StoreDbConn,
-    tx: State<Arc<Mutex<Tx>>>,
-    event: Result<Json<Event>, JsonError>,
-) -> StoreResponder {
-    let event = event?.into_inner();
-
-    let result = diesel::insert_into(schema::events::table)
-        .values::<NewEvent>(event.into())
-        .get_result::<reactrix::Event>(&*conn);
-
-    match result {
-        Ok(event) => match tx.lock()?.send(event.sequence) {
-            Ok(()) => StoreResponder::ok(Status::Created, Some(&event.sequence)),
-            Err(e) => StoreResponder::error(
-                Status::InternalServerError,
-                &format!("Created but couldn't notify: {:?}", e),
-            ),
+async fn event_put(
+    event: NewEvent,
+    store: Arc<dyn EventStore>,
+    tx: Arc<Mutex<Tx>>,
+) -> Result<impl Reply, Infallible> {
+    match store.store(event) {
+        Ok(i) => match tx.lock() {
+            Ok(tx) => match tx.send(i) {
+                Ok(()) => Ok(warp::reply::with_status(
+                    warp::reply::json(&ApiResult::Ok { data: i }),
+                    StatusCode::CREATED,
+                )
+                .into_response()),
+                Err(e) => {
+                    let message = format!("Created but couldn't notify: {:?}", e);
+                    error!("{}", &message);
+                    Ok(error_response(message, StatusCode::INTERNAL_SERVER_ERROR))
+                }
+            },
+            Err(e) => Ok(error_response(
+                e.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )),
         },
-        Err(DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, _)) => {
-            StoreResponder::error(Status::BadRequest, &"Out of Sequence")
-        }
-        Err(e) => StoreResponder::error(Status::InternalServerError, &format!("{:?}", e)),
+        Err(e) => Ok(error_response(
+            e.to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )),
     }
 }
 
-#[put("/v1/store", data = "<data>")]
-fn store(conn: StoreDbConn, data: Vec<u8>) -> StoreResponder {
-    let store = DataStore::new(&conn);
-    match store.store(&data) {
-        Ok(hash) => StoreResponder::ok(Status::Ok, Some(&hex::encode(hash))),
-        Err(e) => StoreResponder::error(
-            Status::InternalServerError,
-            &format!("Couldn't store data: {}", e),
-        ),
-    }
-}
-
-#[get("/v1/retrieve/<id>")]
-fn retrieve(conn: StoreDbConn, id: String) -> Option<Vec<u8>> {
-    let store = DataStore::new(&conn);
+async fn data_get(id: String, store: Arc<dyn DataStore>) -> Result<impl warp::Reply, Infallible> {
     let hash = match hex::decode(id.as_bytes()) {
         Ok(hash) => hash,
         Err(e) => {
-            warn!("Couldn't decode hash: {}", e);
-            return None;
+            let message = format!("Couldn't decode hash: {}", e);
+            warn!("{}", &message);
+            return Ok(error_response(message, StatusCode::BAD_REQUEST));
         }
     };
 
     match store.retrieve(&hash) {
-        Ok(data) => Some(data),
-        Err(DataStoreError::NoRecord) => None,
+        Ok(data) => Ok(data.into_response()),
+        Err(DataStoreError::NoRecord) => Ok(StatusCode::NOT_FOUND.into_response()),
         Err(e) => {
-            error!("Couldn't retrieve data hash {}: {}", id, e);
-            None
+            let message = format!("Couldn't retrieve data hash {}: {}", id, e);
+            error!("{}", &message);
+            Ok(error_response(message, StatusCode::INTERNAL_SERVER_ERROR))
         }
     }
 }
 
-// TODO config handler (ZMQ port etc)
-
-#[catch(404)]
-fn not_found() -> StoreResponder {
-    StoreResponder::error(Status::NotFound, &"No such resource")
-}
-
-#[catch(500)]
-fn internal_server_error() -> StoreResponder {
-    StoreResponder::error(Status::InternalServerError, &"Internal server error")
-}
-
-struct Zmq {
-    tx: Arc<Mutex<Tx>>,
-}
-
-impl Fairing for Zmq {
-    fn info(&self) -> fairing::Info {
-        fairing::Info {
-            name: "ØMQ Channel",
-            kind: fairing::Kind::Attach,
+async fn data_put(bytes: Bytes, store: Arc<dyn DataStore>) -> Result<impl warp::Reply, Infallible> {
+    match store.store(bytes.into_iter().collect::<Vec<u8>>().as_ref()) {
+        Ok(hash) => Ok(hex::encode(hash).into_response()),
+        Err(e) => {
+            let message = format!("Couldn't store data: {}", e);
+            error!("{}", &message);
+            Ok(error_response(message, StatusCode::INTERNAL_SERVER_ERROR))
         }
     }
-
-    fn on_attach(&self, rocket: Rocket) -> Result<Rocket, Rocket> {
-        Ok(rocket.manage(self.tx.clone()))
-    }
 }
 
-/// reactrix-store
+fn database_url() -> Result<String, ReactrixError> {
+    env::var("DATABASE_URL").or_else(|_| Err(ReactrixError::Var("DATABASE_URL".to_string())))
+}
+
 #[derive(Debug, StructOpt)]
-#[structopt(raw(setting = "structopt::clap::AppSettings::ColoredHelp"))]
-struct Cli {}
+#[structopt(
+    raw(setting = "structopt::clap::AppSettings::ColoredHelp"),
+    rename_all = "kebab-case"
+)]
+struct Cli {
+    /// Address to listen on
+    #[structopt(short, long, default_value = "127.0.0.1")]
+    address: Ipv4Addr,
 
-fn main() -> Result<(), ExitFailure> {
-    Cli::from_args();
+    /// HTTP port to listen on
+    #[structopt(short = "p", long = "port", default_value = "8000")]
+    http_port: u16,
+
+    /// ØMQ port to listen on
+    #[structopt(long, default_value = "5660")]
+    zmq_port: u16,
+}
+
+async fn init_stores(url: &str) -> Result<(Arc<dyn EventStore>, Arc<dyn DataStore>), ExitFailure> {
+    match Url::parse(url)?.scheme() {
+        "postgres" => {
+            let pool = Arc::new(Pool::new(ConnectionManager::<PgConnection>::new(url))?);
+            Ok((
+                Arc::new(PostgresEventStore::new(pool.clone())),
+                Arc::new(PostgresDataStore::new(pool)),
+            ))
+        }
+        "mongodb" => {
+            let mut options = ClientOptions::parse(url).await?;
+            options.app_name = Some("reactrix-store".to_string());
+            let client = Client::with_options(options)?;
+            let db = client.database("reactrix");
+            Ok((
+                Arc::new(MongoEventStore::new(db.clone())),
+                Arc::new(MongoDataStore::new(db)),
+            ))
+        }
+        s => Err(ReactrixError::UnknownDatabase(s.to_string()).into()),
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), ExitFailure> {
+    let cli = Cli::from_args();
     dotenv()?;
     env_logger::builder().format_timestamp(None).init();
-    let tx = mq::launch()?;
 
-    Err(rocket::ignite()
-        .attach(StoreDbConn::fairing())
-        .attach(Zmq {
-            tx: Arc::new(Mutex::new(tx)),
-        })
-        .mount("/", routes![create, store, retrieve])
-        .register(catchers![not_found, internal_server_error])
-        .launch()
-        .into())
+    let url = database_url()?;
+    let (event_store, data_store) = init_stores(&url).await?;
+
+    let event_store = warp::any().map(move || event_store.clone());
+    let data_store = warp::any().map(move || data_store.clone());
+
+    let tx = Arc::new(Mutex::new(mq::launch(cli.address, cli.zmq_port)?));
+    let tx = warp::any().map(move || tx.clone());
+
+    let prefix = warp::path!("v1" / ..);
+
+    let config = Config {
+        address: cli.address.to_string(),
+        http_port: cli.http_port,
+        zmq_port: cli.zmq_port,
+    };
+
+    let config_get = warp::path!("config")
+        .and(warp::get())
+        .map(move || config.clone())
+        .and_then(config_get);
+
+    let event_get = warp::path!("events" / i64)
+        .and(warp::get())
+        .and(event_store.clone())
+        .and_then(event_get);
+
+    let event_put = warp::path!("events")
+        .and(warp::put())
+        .and(warp::body::json())
+        .and(event_store)
+        .and(tx)
+        .and_then(event_put);
+
+    let data_get = warp::path!("data" / String)
+        .and(warp::get())
+        .and(data_store.clone())
+        .and_then(data_get);
+
+    let data_put = warp::path!("data")
+        .and(warp::put())
+        .and(warp::body::bytes())
+        .and(data_store)
+        .and_then(data_put);
+
+    let api = prefix
+        .and(
+            config_get
+                .or(event_get)
+                .or(event_put)
+                .or(data_get)
+                .or(data_put),
+        )
+        .with(warp::log("reactrix"));
+
+    warp::serve(api).run((cli.address, cli.http_port)).await;
+    Ok(())
 }

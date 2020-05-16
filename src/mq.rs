@@ -16,25 +16,30 @@
 
 use log::{debug, error};
 use rmp_serde as rmp;
+use std::net::Ipv4Addr;
 use std::sync::mpsc;
 use std::thread;
+use url::Url;
 use zmq::{Context, SocketEvent};
 
 pub type Tx = mpsc::Sender<i64>;
-pub type Rx = mpsc::Receiver<i64>;
-pub type TxError = mpsc::SendError<i64>;
 
 enum Publish {
     Set(i64),
     Send,
 }
 
-fn poll(context: &Context) -> Result<mpsc::Sender<Publish>, failure::Error> {
+fn poll(
+    address: Ipv4Addr,
+    port: u16,
+    context: &Context,
+) -> Result<mpsc::Sender<Publish>, failure::Error> {
     let (tx, rx) = mpsc::channel::<Publish>();
+    let url = Url::parse(&format!("tcp://{}:{}", &address, &port))?;
 
     let socket = context.socket(zmq::PUB)?;
     socket.monitor("inproc://monitor", SocketEvent::ACCEPTED as i32)?;
-    socket.bind("tcp://*:5660")?; // TODO Configurable
+    socket.bind(&url.into_string())?;
     let mut id = 0;
 
     thread::spawn(move || {
@@ -66,10 +71,10 @@ fn poll(context: &Context) -> Result<mpsc::Sender<Publish>, failure::Error> {
     Ok(tx)
 }
 
-pub fn launch() -> Result<Tx, failure::Error> {
+pub fn launch(address: Ipv4Addr, port: u16) -> Result<Tx, failure::Error> {
     let (tx, rx) = mpsc::channel::<i64>();
     let context = Context::new();
-    let poll_tx = poll(&context)?;
+    let poll_tx = poll(address, port, &context)?;
     let poll_tx_monitor = poll_tx.clone();
 
     let monitor = context.socket(zmq::PAIR)?;
