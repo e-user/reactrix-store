@@ -46,6 +46,16 @@ impl EventStore for PostgresEventStore {
             .filter(dsl::sequence.eq(id))
             .first::<Event>(&self.0.get()?)?)
     }
+
+    fn sequence(&self) -> Result<i64> {
+        use schema::events::dsl;
+
+        Ok(dsl::events
+            .select(dsl::sequence)
+            .order(dsl::sequence.desc())
+            .limit(1)
+            .first::<i64>(&self.0.get()?)?)
+    }
 }
 
 impl From<DieselError> for EventStoreError {

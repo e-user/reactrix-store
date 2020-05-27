@@ -21,6 +21,7 @@ use bson::{doc, Bson, DecoderError};
 use chrono::Utc;
 use futures::executor::block_on;
 use mongodb::error::Error as MongoError;
+use mongodb::options::FindOneOptions;
 use mongodb::Database;
 use reactrix::{Event, NewEvent};
 
@@ -73,6 +74,22 @@ impl EventStore for MongoEventStore {
                 timestamp: *doc.get_utc_datetime("timestamp")?,
             }),
             Ok(None) => Err(EventStoreError::NoRecord),
+            Err(e) => Err(EventStoreError::Database(e.to_string())),
+        }
+    }
+
+    fn sequence(&self) -> Result<i64> {
+        let options = FindOneOptions::builder()
+            .sort(Some(doc! { "sequence": -1 }))
+            .projection(Some(doc! { "_id": 0, "sequence": 1 }))
+            .build();
+
+        match block_on(self.0.collection("events").find_one(None, Some(options))) {
+            Ok(Some(ref doc)) if doc.contains_key(&"$err") => {
+                Err(EventStoreError::Database(doc.get_str(&"$err")?.to_owned()))
+            }
+            Ok(Some(doc)) => Ok(doc.get_i64(&"sequence")?),
+            Ok(None) => Ok(-1),
             Err(e) => Err(EventStoreError::Database(e.to_string())),
         }
     }

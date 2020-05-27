@@ -28,7 +28,7 @@ use exitfailure::ExitFailure;
 use failure::Fail;
 use log::{error, warn};
 use mongodb::{options::ClientOptions, Client};
-use mq::Tx;
+use mq::{Message, PublishMessage, Tx};
 use reactrix::{ApiResult, NewEvent};
 use serde::Serialize;
 use std::convert::Infallible;
@@ -71,6 +71,16 @@ async fn config_get(config: Config) -> Result<impl Reply, Infallible> {
     Ok(warp::reply::json(&config))
 }
 
+async fn sequence_get(store: Arc<dyn EventStore>) -> Result<impl Reply, Infallible> {
+    match store.sequence() {
+        Ok(id) => Ok(warp::reply::json(&ApiResult::Ok { data: id }).into_response()),
+        Err(e) => Ok(error_response(
+            e.to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )),
+    }
+}
+
 async fn event_get(sequence: i64, store: Arc<dyn EventStore>) -> Result<impl Reply, Infallible> {
     match store.retrieve(sequence) {
         Ok(event) => Ok(warp::reply::json(&ApiResult::Ok { data: event }).into_response()),
@@ -92,7 +102,7 @@ async fn event_put(
 ) -> Result<impl Reply, Infallible> {
     match store.store(event) {
         Ok(i) => match tx.lock() {
-            Ok(tx) => match tx.send(i) {
+            Ok(tx) => match tx.send(PublishMessage::Sequence(i)) {
                 Ok(()) => Ok(warp::reply::with_status(
                     warp::reply::json(&ApiResult::Ok { data: i }),
                     StatusCode::CREATED,
@@ -145,6 +155,31 @@ async fn data_put(bytes: Bytes, store: Arc<dyn DataStore>) -> Result<impl warp::
             error!("{}", &message);
             Ok(error_response(message, StatusCode::INTERNAL_SERVER_ERROR))
         }
+    }
+}
+
+async fn message_post(
+    topic: String,
+    bytes: Bytes,
+    tx: Arc<Mutex<Tx>>,
+) -> Result<impl warp::Reply, Infallible> {
+    let message = Message {
+        topic,
+        data: bytes.into_iter().collect::<Vec<u8>>(),
+    };
+    match tx.lock() {
+        Ok(tx) => match tx.send(PublishMessage::Forward(message)) {
+            Ok(()) => Ok(StatusCode::CREATED.into_response()),
+            Err(e) => {
+                let message = format!("Couldn't forward message: {:?}", e);
+                error!("{}", &message);
+                Ok(error_response(message, StatusCode::INTERNAL_SERVER_ERROR))
+            }
+        },
+        Err(e) => Ok(error_response(
+            e.to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )),
     }
 }
 
@@ -222,16 +257,21 @@ async fn main() -> Result<(), ExitFailure> {
         .map(move || config.clone())
         .and_then(config_get);
 
-    let event_get = warp::path!("events" / i64)
+    let sequence_get = warp::path!("sequence")
+        .and(warp::get())
+        .and(event_store.clone())
+        .and_then(sequence_get);
+
+    let event_get = warp::path!("event" / i64)
         .and(warp::get())
         .and(event_store.clone())
         .and_then(event_get);
 
-    let event_put = warp::path!("events")
+    let event_put = warp::path!("event")
         .and(warp::put())
         .and(warp::body::json())
         .and(event_store)
-        .and(tx)
+        .and(tx.clone())
         .and_then(event_put);
 
     let data_get = warp::path!("data" / String)
@@ -245,13 +285,21 @@ async fn main() -> Result<(), ExitFailure> {
         .and(data_store)
         .and_then(data_put);
 
+    let message_post = warp::path!("message" / String)
+        .and(warp::post())
+        .and(warp::body::bytes())
+        .and(tx)
+        .and_then(message_post);
+
     let api = prefix
         .and(
             config_get
+                .or(sequence_get)
                 .or(event_get)
                 .or(event_put)
                 .or(data_get)
-                .or(data_put),
+                .or(data_put)
+                .or(message_post),
         )
         .with(warp::log("reactrix"));
 

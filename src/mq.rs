@@ -1,6 +1,6 @@
 // This file is part of reactrix-store.
 //
-// Copyright 2019 Alexander Dorn
+// Copyright 2019-2020 Alexander Dorn
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,39 +14,46 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use log::{debug, error};
+use log::{debug, error, info};
 use rmp_serde as rmp;
+use serde::Deserialize;
 use std::net::Ipv4Addr;
 use std::sync::mpsc;
-use std::thread;
+use std::{thread, u16};
 use url::Url;
-use zmq::{Context, SocketEvent};
+use zmq::{Context, Socket, SocketEvent};
 
-pub type Tx = mpsc::Sender<i64>;
-
-enum Publish {
-    Set(i64),
-    Send,
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Message {
+    pub topic: String,
+    pub data: Vec<u8>,
 }
 
-fn poll(
-    address: Ipv4Addr,
-    port: u16,
-    context: &Context,
-) -> Result<mpsc::Sender<Publish>, failure::Error> {
-    let (tx, rx) = mpsc::channel::<Publish>();
+pub enum PublishMessage {
+    Sequence(i64),
+    Forward(Message),
+}
+
+pub type Tx = mpsc::Sender<PublishMessage>;
+
+fn publish(context: &Context, address: Ipv4Addr, port: u16) -> Result<Tx, failure::Error> {
+    let (tx, rx) = mpsc::channel::<PublishMessage>();
     let url = Url::parse(&format!("tcp://{}:{}", &address, &port))?;
 
     let socket = context.socket(zmq::PUB)?;
-    socket.monitor("inproc://monitor", SocketEvent::ACCEPTED as i32)?;
-    socket.bind(&url.into_string())?;
-    let mut id = 0;
+    socket.monitor(
+        "inproc://monitor",
+        SocketEvent::ACCEPTED as i32 + SocketEvent::CLOSED as i32,
+    )?;
+    socket.bind(&url.clone().into_string())?;
+
+    info!("ØMQ publish socket listening on {}", &url);
 
     thread::spawn(move || {
-        for event in rx {
-            match event {
-                Publish::Set(n) => id = n,
-                Publish::Send => {
+        for message in rx {
+            match message {
+                PublishMessage::Sequence(id) => {
                     debug!("Notify sequence {}", id);
 
                     let bytes = match rmp::to_vec(&id) {
@@ -64,6 +71,17 @@ fn poll(
                         error!("{}", e);
                     }
                 }
+
+                PublishMessage::Forward(Message { topic, data }) => {
+                    debug!("Forward message {}", topic);
+
+                    if let Err(e) = socket
+                        .send(&topic, zmq::SNDMORE)
+                        .and_then(|_| socket.send(&data, 0))
+                    {
+                        error!("{}", e);
+                    }
+                }
             }
         }
     });
@@ -71,29 +89,29 @@ fn poll(
     Ok(tx)
 }
 
-pub fn launch(address: Ipv4Addr, port: u16) -> Result<Tx, failure::Error> {
-    let (tx, rx) = mpsc::channel::<i64>();
-    let context = Context::new();
-    let poll_tx = poll(address, port, &context)?;
-    let poll_tx_monitor = poll_tx.clone();
+fn poll_monitor(name: String, monitor: Socket) {
+    thread::spawn(move || loop {
+        if let Ok(message) = monitor.recv_msg(0) {
+            let event = u16::from_ne_bytes([message[0], message[1]]);
+            let _address = monitor.recv_string(0);
 
-    let monitor = context.socket(zmq::PAIR)?;
-    monitor.connect("inproc://monitor")?;
-
-    thread::spawn(move || {
-        for id in rx {
-            poll_tx.send(Publish::Set(id)).unwrap();
-            poll_tx.send(Publish::Send).unwrap();
+            match SocketEvent::from_raw(event) {
+                SocketEvent::ACCEPTED => debug!("{} connection accepted", name),
+                SocketEvent::CLOSED => debug!("{} connection closed", name),
+                _ => error!("Unexpected event"),
+            }
         }
     });
+}
 
-    thread::spawn(move || loop {
-        let _event = monitor.recv_msg(0);
-        let address = monitor.recv_string(0).unwrap().unwrap();
+pub fn launch(address: Ipv4Addr, port: u16) -> Result<Tx, failure::Error> {
+    let context = Context::new();
+    let tx = publish(&context, address, port)?;
 
-        debug!("New connection at {}", &address);
-        poll_tx_monitor.send(Publish::Send).unwrap();
-    });
+    let publish_monitor = context.socket(zmq::PAIR)?;
+    publish_monitor.connect("inproc://monitor")?;
+
+    poll_monitor("Publish".to_string(), publish_monitor);
 
     Ok(tx)
 }

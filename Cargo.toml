@@ -22,9 +22,12 @@ warp = "0.2"
 mongodb = "0.10"
 url = "2.1"
 bytes = "0.5"
-bson = "0.14"
 futures = "0.3"
 chrono = "0.4"
+
+[dependencies.bson]
+version = "0.14"
+features = ["u2i"]
 
 [dependencies.r2d2]
 version = ">= 0.8, < 0.9"

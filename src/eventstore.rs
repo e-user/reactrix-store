@@ -35,4 +35,5 @@ pub type Result<T> = std::result::Result<T, EventStoreError>;
 pub trait EventStore: Send + Sync {
     fn store(&self, data: NewEvent) -> Result<i64>;
     fn retrieve(&self, id: i64) -> Result<Event>;
+    fn sequence(&self) -> Result<i64>;
 }
