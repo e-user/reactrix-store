@@ -70,6 +70,7 @@ impl EventStore for MongoEventStore {
             Ok(Some(doc)) => Ok(Event {
                 sequence: doc.get_i64("sequence")?,
                 version: doc.get_i32("version")?,
+                type_: doc.get_str("type")?.to_string(),
                 data: Bson::Document(doc.get_document("data")?.clone()).into(),
                 timestamp: *doc.get_utc_datetime("timestamp")?,
             }),
